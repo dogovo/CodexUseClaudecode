@@ -14,15 +14,17 @@ Default posture: Claude Code is a read-only reviewer. Codex remains the owner of
 Run Claude Code as a tracked job:
 
 ```bash
-node <skill-dir>/scripts/claude-task.mjs start [--json] [--file prompt.md] [--stdin] <task>
-node <skill-dir>/scripts/claude-task.mjs start --live [--json] [--file prompt.md] [--stdin] <task>
-node <skill-dir>/scripts/claude-task.mjs wait [--retry-stale] <task-id>
+node <skill-dir>/scripts/claude-task.mjs start [--profile safe|research|full] [--json] [--file prompt.md] [--stdin] <task>
+node <skill-dir>/scripts/claude-task.mjs start --live [--profile safe|research|full] [--json] [--file prompt.md] [--stdin] <task>
+node <skill-dir>/scripts/claude-task.mjs start --no-boundaries [--profile safe|research|full] <task>
+node <skill-dir>/scripts/claude-task.mjs wait [--retry-stale] [--retry-failed] <task-id>
 node <skill-dir>/scripts/claude-task.mjs ask <task-id> <follow-up>
 node <skill-dir>/scripts/claude-task.mjs finish <task-id>
 node <skill-dir>/scripts/claude-task.mjs stop <task-id>
 node <skill-dir>/scripts/claude-task.mjs doctor
 node <skill-dir>/scripts/claude-task.mjs status [--json] <task-id>
 node <skill-dir>/scripts/claude-task.mjs result [--json] <task-id>
+node <skill-dir>/scripts/claude-task.mjs clean [--json] [--dry-run] [--older-than 7d]
 ```
 
 For subagent-like use:
@@ -41,9 +43,10 @@ Do not rely on Windows `start`, `Start-Process`, or detached command windows for
 Run all commands from the target repository root unless `CLAUDE_BRIDGE_DIR` is set.
 
 ```bash
-node <skill-dir>/scripts/claude-task.mjs start [--json] [--file prompt.md] [--stdin] <task>
-node <skill-dir>/scripts/claude-task.mjs start --live [--json] [--file prompt.md] [--stdin] <task>
-node <skill-dir>/scripts/claude-task.mjs wait [--retry-stale] [task-id]
+node <skill-dir>/scripts/claude-task.mjs start [--profile safe|research|full] [--json] [--file prompt.md] [--stdin] <task>
+node <skill-dir>/scripts/claude-task.mjs start --live [--profile safe|research|full] [--json] [--file prompt.md] [--stdin] <task>
+node <skill-dir>/scripts/claude-task.mjs start --no-boundaries [--profile safe|research|full] <task>
+node <skill-dir>/scripts/claude-task.mjs wait [--retry-stale] [--retry-failed] [task-id]
 node <skill-dir>/scripts/claude-task.mjs ask <task-id> <follow-up>
 node <skill-dir>/scripts/claude-task.mjs finish <task-id>
 node <skill-dir>/scripts/claude-task.mjs stop [task-id]
@@ -52,13 +55,18 @@ node <skill-dir>/scripts/claude-task.mjs status [--json] [task-id]
 node <skill-dir>/scripts/claude-task.mjs list [--json]
 node <skill-dir>/scripts/claude-task.mjs tail [task-id]
 node <skill-dir>/scripts/claude-task.mjs result [--json] [task-id]
+node <skill-dir>/scripts/claude-task.mjs clean [--json] [--dry-run] [--older-than 7d]
 ```
 
 `start` creates a job and prints the task id.
 
 Use `start --file prompt.md` for long prompts, or pipe data with `start --stdin`, for example `git diff | node <skill-dir>/scripts/claude-task.mjs start --stdin "Review this diff"`. Use `--json` on `start`, `status`, `list`, or `result` when another script or Codex worker needs machine-readable output.
 
-`wait` runs Claude Code for the job and writes stream output to the job log. It should usually be run by a Codex worker subagent for long tasks. If a worker is interrupted and the task becomes `stale`, use `wait --retry-stale <task-id>` to rerun the same prompt into the same tracked log.
+Use `--profile safe`, `--profile research`, or `--profile full` to choose Claude Code's tool surface. `safe` is the default read-oriented profile. `research` adds `WebFetch` and `WebSearch`. `full` passes `--tools default` to Claude Code for tasks where Codex intentionally wants the fuller Claude Code tool set. `full` may no longer behave like a read-only reviewer tool surface, so Codex must review the result and decide what to keep. The selected profile is saved in task metadata so a worker running `wait` uses the same launch configuration.
+
+Use `--no-boundaries` only when the prompt already contains its own complete operating boundaries. By default, the helper appends a short boundary block that tells Claude Code it is an external helper for Codex and should report findings clearly.
+
+`wait` runs Claude Code for the job and writes stream output to the job log. It should usually be run by a Codex worker subagent for long tasks. If a worker is interrupted and the task becomes `stale`, use `wait --retry-stale <task-id>` to rerun the same prompt into the same tracked log. If Claude Code fails, times out, or exits early, use `wait --retry-failed <task-id>` after checking the log.
 
 `start --live` runs Claude Code with streaming stdin so Codex can provide follow-up guidance while Claude is working.
 
@@ -72,7 +80,7 @@ Use `start --file prompt.md` for long prompts, or pipe data with `start --stdin`
 
 `status` reports `queued`, `running`, `stale`, `completed`, `failed`, `canceled`, or `missing`.
 
-`result` extracts Claude Code's final text from `stream-json` logs.
+`result` extracts Claude Code's final text from `stream-json` logs. With `--json`, it also returns `parsedJson` when the final text is JSON or a fenced JSON block.
 
 `tail` prints recent raw logs when debugging. Pass a line count as the second argument, for example `tail <task-id> 40`.
 
@@ -81,13 +89,15 @@ Use `start --file prompt.md` for long prompts, or pipe data with `start --stdin`
 Use task groups when Codex wants several Claude Code reviewers in parallel:
 
 ```bash
-node <skill-dir>/scripts/claude-task.mjs batch --json --file tasks.txt
-node <skill-dir>/scripts/claude-task.mjs wait-group --json --concurrency 2 <group-id>
+node <skill-dir>/scripts/claude-task.mjs batch --json --profile research [--no-boundaries] --file tasks.txt
+node <skill-dir>/scripts/claude-task.mjs wait-group --json [--retry-failed] --concurrency 2 <group-id>
 node <skill-dir>/scripts/claude-task.mjs group-status --json <group-id>
 node <skill-dir>/scripts/claude-task.mjs group-result --json <group-id>
 ```
 
-`batch` creates one task per non-empty line. `wait-group` runs multiple Claude Code processes concurrently and automatically retries `stale` group tasks, which is useful when a Codex worker times out or is interrupted before Claude Code writes a final result.
+`batch` creates one task per non-empty line. Use `batch --separator=--- --file tasks.md` for multi-line prompts, or `batch --jsonl --file tasks.jsonl` for JSONL where each entry is a string or an object with a `prompt` field. `wait-group` runs multiple Claude Code processes concurrently and automatically retries `stale` group tasks, which is useful when a Codex worker times out or is interrupted before Claude Code writes a final result. Add `wait-group --retry-failed <group-id>` when you intentionally want failed group tasks to be rerun.
+
+`clean` removes old task and group logs from `.codex/claude-code/`. Use `--dry-run` before deleting, and set age with values like `12h`, `7d`, or `30m`.
 
 ## Storage
 
@@ -134,14 +144,22 @@ Useful overrides:
 
 ```bash
 CLAUDE_TASK_BIN=/absolute/path/to/claude
-CLAUDE_TASK_MAX_BUDGET_USD=20.00
+CLAUDE_TASK_PROFILE=research
+CLAUDE_TASK_ALLOWED_TOOLS=Read,Grep,Glob,Bash(git diff),Bash(git status),Bash(git log),Bash(git show)
+CLAUDE_TASK_TOOLS=default
+CLAUDE_TASK_PERMISSION_MODE=acceptEdits
+CLAUDE_TASK_SESSION_PERSISTENCE=1
+CLAUDE_TASK_MAX_BUDGET_USD=5.00
+CLAUDE_TASK_TIMEOUT_MS=0
 CLAUDE_TASK_MAX_TURNS=8
 CLAUDE_TASK_MODEL=sonnet
-CLAUDE_TASK_NO_SESSION_PERSISTENCE=1
 CLAUDE_TASK_POLL_MS=500
+CLAUDE_TASK_BOUNDARIES="Custom task boundaries..."
 ```
 
 `CLAUDE_TASK_BIN` is also useful for failure tests.
+
+`CLAUDE_TASK_TIMEOUT_MS` is saved when the task is created. The default `0` means `wait` can run indefinitely, which is useful for very long Claude Code reviews. Set a positive value such as `1800000` to fail and stop a stuck Claude Code process after that many milliseconds. Timeout and `stop` paths clean up the Claude Code process tree where the platform supports it.
 
 ## Prompting
 
@@ -167,7 +185,7 @@ Avoid handing Claude Code urgent blocking work that Codex must integrate immedia
 This skill sends every prompt through Claude Code's official SDK JSONL protocol:
 
 ```bash
-claude -p --input-format stream-json --output-format stream-json --verbose
+claude -p --input-format stream-json --output-format stream-json --verbose --permission-mode acceptEdits --allowed-tools "Read,Grep,Glob,Bash(git diff),Bash(git status),Bash(git log),Bash(git show)" --no-session-persistence
 ```
 
 Normal tasks send one JSON user message and close stdin immediately. Live tasks keep stdin open so follow-up user messages can be sent while Claude Code is working.
@@ -175,6 +193,7 @@ Normal tasks send one JSON user message and close stdin immediately. Live tasks 
 Reasons:
 
 - `stream-json` requires `--verbose`.
+- `acceptEdits` plus `--allowed-tools` lets Claude Code inspect files while keeping tool access constrained.
 - Passing multi-line prompts as `cmd.exe` arguments is fragile.
 - Detached Windows consoles can corrupt non-ASCII paths.
 - Codex-managed workers are easier to track than OS-level background windows.
@@ -197,13 +216,13 @@ For live mode, `wait` should normally run in a Codex worker subagent. The main C
 
 ## Testing
 
-Run the local self-test without real Claude Code:
+Run the local self-test:
 
 ```bash
 node <skill-dir>/scripts/self-test.mjs
 ```
 
-The self-test creates a fake `claude` executable and verifies normal JSONL tasks, live follow-ups, status logging, and result extraction.
+The self-test uses an isolated temporary test executable and verifies normal JSONL tasks, live follow-ups, status logging, failure recovery, and result extraction.
 
 ## Failure Handling
 
