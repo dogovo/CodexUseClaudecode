@@ -1,1 +1,11 @@
-.codex/claude-code/
+.codex/
+.claude/
+
+node_modules/
+
+*.log
+*.tmp
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*

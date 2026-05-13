@@ -1,2 +1,11 @@
-# Auto detect text files and perform LF normalization
-* text=auto
+# Keep skill source stable across Windows, WSL, macOS, and Linux.
+* text=auto eol=lf
+
+*.md text eol=lf
+*.mjs text eol=lf
+*.js text eol=lf
+*.json text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.gitignore text eol=lf
+*.gitattributes text eol=lf
