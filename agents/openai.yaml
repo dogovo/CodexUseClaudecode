@@ -1,6 +1,6 @@
 interface:
-  display_name: "Codex Use Claude"
+  display_name: "Codex Use Claude Code"
   short_description: "Run Claude Code as a tracked helper"
-  default_prompt: "Use $codex-use-claude to ask Claude Code for a read-only review and collect the result."
+  default_prompt: "Use $codex-use-claude-code to ask Claude Code for a read-only review and collect the result."
 policy:
   allow_implicit_invocation: true
