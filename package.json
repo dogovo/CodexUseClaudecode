@@ -1,0 +1,17 @@
+{
+  "name": "codex-use-claude-code",
+  "version": "0.2.0",
+  "private": true,
+  "description": "Run Claude Code from Codex as a tracked helper through the Claude Agent SDK.",
+  "type": "module",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.3.168"
+  },
+  "scripts": {
+    "doctor": "node scripts/claude-task.mjs doctor",
+    "test": "node scripts/self-test.mjs"
+  }
+}
