@@ -49,7 +49,12 @@ try {
   if (startedMeta.storage !== "compact-json") throw new Error("task should use compact-json storage");
   if (startedMeta.options.permissionMode !== "dontAsk") throw new Error("default permission mode should be dontAsk");
   if (!startedMeta.options.tools.includes("Bash")) throw new Error("safe tools should include Bash for read-only git commands");
+  if (!startedMeta.options.tools.includes("AskUserQuestion")) throw new Error("safe tools should include AskUserQuestion for explicit approval/clarification flows");
+  if (!startedMeta.options.allowedTools.includes("Read")) throw new Error("safe allowedTools should pre-approve Read in dontAsk mode");
+  if (!startedMeta.options.allowedTools.includes("Grep")) throw new Error("safe allowedTools should pre-approve Grep in dontAsk mode");
+  if (!startedMeta.options.allowedTools.includes("Glob")) throw new Error("safe allowedTools should pre-approve Glob in dontAsk mode");
   if (!startedMeta.options.allowedTools.includes("Bash(git diff *)")) throw new Error("safe allowedTools should include git diff with arguments");
+  if (startedMeta.options.approvalMode !== "deny") throw new Error("default approval mode should be deny");
   if (startedMeta.options.persistSession !== false) throw new Error("SDK session persistence should be disabled by default");
   if (startedMeta.events.length > 8) throw new Error("compact event history should respect event limit");
   const logFiles = await findFiles(bridgeDir, ".log");
@@ -72,6 +77,7 @@ try {
   const researchStart = JSON.parse(await run(["start", "--json", "--profile", "research", "Research profile"], { env }));
   const researchMeta = await readTaskMeta(bridgeDir, researchStart.id);
   if (!researchMeta.options.tools.includes("WebSearch")) throw new Error("research profile should include WebSearch");
+  if (!researchMeta.options.allowedTools.includes("WebSearch")) throw new Error("research allowedTools should pre-approve WebSearch in dontAsk mode");
   await run(["stop", researchStart.id], { env });
 
   const fullStart = JSON.parse(await run(["start", "--json", "--profile=full", "Full profile"], { env }));
@@ -79,6 +85,23 @@ try {
   if (fullMeta.options.tools?.preset !== "claude_code") throw new Error("full profile should enable Claude Code preset tools");
   await run(["stop", fullStart.id], { env });
   trace("profiles");
+
+  const approvalStart = JSON.parse(await run(["start", "--json", "--approval", "ask", "Approval prompt"], { env }));
+  const approvalMeta = await readTaskMeta(bridgeDir, approvalStart.id);
+  if (approvalMeta.options.permissionMode !== "default") throw new Error("--approval ask should switch dontAsk profiles to default permission mode");
+  const approvalWaiter = run(["wait", approvalStart.id], { env, background: true });
+  await delay(300);
+  const pendingApproval = JSON.parse(await run(["approvals", "--json", approvalStart.id], { env }));
+  if (pendingApproval.approval?.status !== "pending") {
+    throw new Error(`approval should be pending before approve:\n${JSON.stringify(pendingApproval, null, 2)}`);
+  }
+  await run(["approve", approvalStart.id, pendingApproval.approval.id], { env });
+  await approvalWaiter;
+  const approvalResult = JSON.parse(await run(["result", "--json", approvalStart.id], { env }));
+  assertIncludes(approvalResult.result, "approval:allow", "approve should release a pending SDK approval request");
+  const approvalStatusAfter = JSON.parse(await run(["status", "--json", approvalStart.id], { env }));
+  if (approvalStatusAfter.pendingApproval !== null) throw new Error("consumed approvals should clear pendingApproval from status");
+  trace("approval");
 
   const envStart = JSON.parse(await run(["start", "--json", "Environment overrides"], {
     env: {
@@ -383,6 +406,18 @@ export function query({ prompt, options = {} }) {
     }
 
     const joined = messages.join("\n---\n");
+    let approvalText = "";
+    if (joined.includes("Approval prompt")) {
+      const decision = await options.canUseTool?.("Bash", { command: "npm test" }, {
+        signal: options.abortController?.signal,
+        title: "Claude wants to run npm test",
+        displayName: "Run command",
+        description: "Fake SDK approval request"
+      });
+      approvalText = "approval:" + (decision?.behavior || "missing");
+      yield assistant(approvalText);
+    }
+    const resultText = [joined, approvalText].filter(Boolean).join("\n");
     yield {
       type: "result",
       subtype: "success",
@@ -395,7 +430,7 @@ export function query({ prompt, options = {} }) {
       usage: { input_tokens: 1, output_tokens: 1 },
       modelUsage: {},
       permission_denials: [],
-      result: joined.includes("Review prompt file") ? "{\"reviewed\":true,\"source\":\"file\"}" : joined,
+      result: joined.includes("Review prompt file") ? "{\"reviewed\":true,\"source\":\"file\"}" : resultText,
       session_id: sessionId,
       uuid: "00000000-0000-4000-8000-000000000002"
     };

@@ -1,6 +1,6 @@
 ---
 name: codex-use-claude-code
-description: Bridge Codex to Claude Code as a lightweight tracked helper through the official Claude Agent TypeScript SDK. Use when Codex should ask Claude Code for code review, architecture review, risk analysis, second opinions, long-running investigation, or collaborative agent work while keeping Codex in control through compact start/wait/status/result records.
+description: Bridge Codex to Claude Code as a lightweight tracked helper through the official Claude Agent TypeScript SDK. Use when Codex should ask Claude Code for code review, architecture review, risk analysis, official documentation checks, second opinions, long-running investigation, or collaborative agent work while Codex remains in control through compact start/wait/status/result records and explicit approvals.
 ---
 
 # Codex Use Claude Code
@@ -14,23 +14,26 @@ Default posture: Claude Code is a bounded reviewer. Codex remains the owner of e
 Run Claude Code as a tracked job:
 
 ```bash
-node <skill-dir>/scripts/claude-task.mjs start [--profile safe|research|full] [--json] [--file prompt.md] [--stdin] <task>
-node <skill-dir>/scripts/claude-task.mjs start --live [--profile safe|research|full] [--json] [--file prompt.md] [--stdin] <task>
+node <skill-dir>/scripts/claude-task.mjs start [--profile safe|research|full] [--approval ask|allow|deny] [--json] [--file prompt.md] [--stdin] <task>
+node <skill-dir>/scripts/claude-task.mjs start --live [--profile safe|research|full] [--approval ask|allow|deny] [--json] [--file prompt.md] [--stdin] <task>
 node <skill-dir>/scripts/claude-task.mjs wait [--retry-stale] [--retry-failed] <task-id>
 node <skill-dir>/scripts/claude-task.mjs ask <task-id> <follow-up>
 node <skill-dir>/scripts/claude-task.mjs finish <task-id>
 node <skill-dir>/scripts/claude-task.mjs stop <task-id>
+node <skill-dir>/scripts/claude-task.mjs approvals [--json] <task-id>
+node <skill-dir>/scripts/claude-task.mjs approve <task-id> [approval-id]
+node <skill-dir>/scripts/claude-task.mjs deny <task-id> [approval-id] [message]
 node <skill-dir>/scripts/claude-task.mjs status [--json] <task-id>
 node <skill-dir>/scripts/claude-task.mjs tail <task-id> 40
 node <skill-dir>/scripts/claude-task.mjs result [--json] <task-id>
 ```
 
-For subagent-like use:
+For worker-style use:
 
 1. Run `start` locally from the target repository root.
 2. Delegate `wait <task-id>` to a Codex worker subagent.
 3. Keep working locally while the worker waits for Claude Code.
-4. Use `status`, `tail`, or `result` from the main thread to collect output.
+4. Use `status`, `tail`, `approvals`, or `result` from the main thread.
 
 If the task may need mid-flight guidance, start it with `--live`. Then the main thread can run `ask <task-id> <follow-up>` while the worker is still running `wait`. Live tasks must be closed with `finish <task-id>`.
 
@@ -44,7 +47,7 @@ import { query } from "@anthropic-ai/claude-agent-sdk";
 
 It does not manually spawn the Claude CLI, does not hand-roll the lower-level JSONL protocol, and does not require a TypeScript build step. The script is a plain ESM `.mjs` wrapper around the TypeScript SDK.
 
-Run `npm install` in the skill directory before first real use so the SDK dependency and bundled platform binary are available.
+Run `npm install` in the skill directory before first real use. The official SDK normally bundles the platform Claude Code binary through optional dependencies, so a separate Claude Code CLI install is not required. Use `CLAUDE_TASK_BIN` only when you need to override `pathToClaudeCodeExecutable`.
 
 ## Compact Storage
 
@@ -65,7 +68,7 @@ Defaults:
 - Retain at least recent terminal tasks: `CLAUDE_TASK_RETAIN_TASKS=50`
 - SDK transcript persistence: disabled by default via `persistSession: false`
 
-`start` runs automatic cleanup for terminal tasks. Running, queued, and stale tasks are not auto-deleted.
+`start` runs automatic cleanup for terminal tasks. Running, queued, approval-pending, and stale tasks are not auto-deleted.
 
 ## Profiles
 
@@ -76,8 +79,11 @@ Use `--profile safe`, `--profile research`, or `--profile full`.
 ```js
 {
   permissionMode: "dontAsk",
-  tools: ["Read", "Grep", "Glob", "Bash"],
+  tools: ["Read", "Grep", "Glob", "Bash", "AskUserQuestion"],
   allowedTools: [
+    "Read",
+    "Grep",
+    "Glob",
     "Bash(git diff)",
     "Bash(git diff *)",
     "Bash(git status)",
@@ -87,25 +93,52 @@ Use `--profile safe`, `--profile research`, or `--profile full`.
     "Bash(git show)",
     "Bash(git show *)"
   ],
+  approvalMode: "deny",
   persistSession: false,
   maxBudgetUsd: 5.00
 }
 ```
 
-`research` adds `WebFetch` and `WebSearch`.
+`research` adds and pre-approves `WebFetch` and `WebSearch`.
 
-`full` uses the Claude Code preset tool surface and `acceptEdits`. Use it only when Codex intentionally wants Claude Code's fuller tool set. Codex must still review the result and decide what to keep.
+`full` uses the Claude Code preset tool surface and `acceptEdits`. Use it only when Codex intentionally wants Claude Code's fuller tool set. Prefer `--approval ask` when commands or other unapproved actions may be needed.
+
+## Approvals
+
+The default approval mode is `deny`, so hidden SDK permission prompts do not stall the job. Use `--approval ask` for yes/no control:
+
+```bash
+node <skill-dir>/scripts/claude-task.mjs start --profile full --approval ask <task>
+node <skill-dir>/scripts/claude-task.mjs wait <task-id>
+```
+
+If `wait` runs in an interactive terminal, the script asks `[y/N]`. If `wait` runs in a non-interactive worker, use the main thread:
+
+```bash
+node <skill-dir>/scripts/claude-task.mjs approvals <task-id>
+node <skill-dir>/scripts/claude-task.mjs approve <task-id> <approval-id>
+node <skill-dir>/scripts/claude-task.mjs deny <task-id> <approval-id> "Reason for Claude"
+```
+
+Modes:
+
+- `deny`: reject unapproved requests.
+- `ask`: wait for a human decision. For `safe` and `research`, this switches `permissionMode` from `dontAsk` to `default` so the SDK `canUseTool` callback can fire.
+- `allow`: automatically allow unapproved requests. Use only in controlled directories or trusted automation.
 
 ## Commands
 
 ```bash
-node <skill-dir>/scripts/claude-task.mjs start [--profile safe|research|full] [--json] [--file prompt.md] [--stdin] <task>
-node <skill-dir>/scripts/claude-task.mjs start --live [--profile safe|research|full] [--json] [--file prompt.md] [--stdin] <task>
+node <skill-dir>/scripts/claude-task.mjs start [--profile safe|research|full] [--approval ask|allow|deny] [--json] [--file prompt.md] [--stdin] <task>
+node <skill-dir>/scripts/claude-task.mjs start --live [--profile safe|research|full] [--approval ask|allow|deny] [--json] [--file prompt.md] [--stdin] <task>
 node <skill-dir>/scripts/claude-task.mjs start --no-boundaries [--profile safe|research|full] <task>
 node <skill-dir>/scripts/claude-task.mjs wait [--retry-stale] [--retry-failed] [task-id]
 node <skill-dir>/scripts/claude-task.mjs ask <task-id> <follow-up>
 node <skill-dir>/scripts/claude-task.mjs finish <task-id>
 node <skill-dir>/scripts/claude-task.mjs stop [task-id]
+node <skill-dir>/scripts/claude-task.mjs approvals [--json] [task-id]
+node <skill-dir>/scripts/claude-task.mjs approve <task-id> [approval-id]
+node <skill-dir>/scripts/claude-task.mjs deny <task-id> [approval-id] [message]
 node <skill-dir>/scripts/claude-task.mjs doctor
 node <skill-dir>/scripts/claude-task.mjs status [--json] [task-id]
 node <skill-dir>/scripts/claude-task.mjs list [--json]
@@ -123,7 +156,7 @@ node <skill-dir>/scripts/claude-task.mjs clean [--json] [--dry-run] [--older-tha
 Use task groups when Codex wants several Claude Code reviewers:
 
 ```bash
-node <skill-dir>/scripts/claude-task.mjs batch --json --profile research [--no-boundaries] --file tasks.txt
+node <skill-dir>/scripts/claude-task.mjs batch --json --profile research [--approval ask] [--no-boundaries] --file tasks.txt
 node <skill-dir>/scripts/claude-task.mjs wait-group --json [--retry-failed] --concurrency 2 <group-id>
 node <skill-dir>/scripts/claude-task.mjs group-status --json <group-id>
 node <skill-dir>/scripts/claude-task.mjs group-result --json <group-id>
@@ -137,8 +170,9 @@ Useful overrides:
 
 ```bash
 CLAUDE_TASK_PROFILE=research
-CLAUDE_TASK_TOOLS="Read,Grep,Glob,Bash,WebFetch,WebSearch"
-CLAUDE_TASK_ALLOWED_TOOLS="Bash(git diff),Bash(git diff *),Bash(git status),Bash(git status *),Bash(git log),Bash(git log *),Bash(git show),Bash(git show *)"
+CLAUDE_TASK_APPROVAL_MODE=ask
+CLAUDE_TASK_TOOLS="Read,Grep,Glob,Bash,AskUserQuestion,WebFetch,WebSearch"
+CLAUDE_TASK_ALLOWED_TOOLS="Read,Grep,Glob,Bash(git diff),Bash(git diff *),Bash(git status),Bash(git status *),Bash(git log),Bash(git log *),Bash(git show),Bash(git show *)"
 CLAUDE_TASK_PERMISSION_MODE=dontAsk
 CLAUDE_TASK_SESSION_PERSISTENCE=1
 CLAUDE_TASK_MAX_BUDGET_USD=5.00
@@ -177,13 +211,15 @@ Common causes:
 - The model or provider is unavailable.
 - The task exceeded `CLAUDE_TASK_TIMEOUT_MS`, `CLAUDE_TASK_MAX_TURNS`, or `CLAUDE_TASK_MAX_BUDGET_USD`.
 - The task is live and `finish <task-id>` has not been sent.
+- The task is waiting for approval. Use `approvals <task-id>`, then `approve` or `deny`.
 
 ## Testing
 
-Run the local self-test:
+Run the local self-test and audit:
 
 ```bash
 node <skill-dir>/scripts/self-test.mjs
+npm audit
 ```
 
 The self-test uses a fake SDK module and does not require Claude credentials.

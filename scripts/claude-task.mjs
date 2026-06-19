@@ -14,7 +14,7 @@ const command = process.argv[2] || "help";
 const args = process.argv.slice(3);
 
 const terminalStatuses = new Set(["completed", "failed", "canceled"]);
-const readOnlyTools = ["Read", "Grep", "Glob", "Bash"];
+const readOnlyTools = ["Read", "Grep", "Glob", "Bash", "AskUserQuestion"];
 const readOnlyGitTools = [
   "Bash(git diff)",
   "Bash(git diff *)",
@@ -25,21 +25,25 @@ const readOnlyGitTools = [
   "Bash(git show)",
   "Bash(git show *)"
 ];
+const readOnlyAllowedTools = ["Read", "Grep", "Glob", ...readOnlyGitTools];
 const toolProfiles = {
   safe: {
     permissionMode: "dontAsk",
     tools: readOnlyTools,
-    allowedTools: readOnlyGitTools
+    allowedTools: readOnlyAllowedTools,
+    approvalMode: "deny"
   },
   research: {
     permissionMode: "dontAsk",
     tools: [...readOnlyTools, "WebFetch", "WebSearch"],
-    allowedTools: readOnlyGitTools
+    allowedTools: [...readOnlyAllowedTools, "WebFetch", "WebSearch"],
+    approvalMode: "deny"
   },
   full: {
     permissionMode: "acceptEdits",
     tools: { type: "preset", preset: "claude_code" },
-    allowedTools: []
+    allowedTools: [],
+    approvalMode: "deny"
   }
 };
 
@@ -58,6 +62,12 @@ try {
     await finishTask(args);
   } else if (command === "stop") {
     await stopTask(args);
+  } else if (command === "approvals") {
+    await approvalsTask(args);
+  } else if (command === "approve") {
+    await decideApprovalTask(args, "approved");
+  } else if (command === "deny") {
+    await decideApprovalTask(args, "denied");
   } else if (command === "doctor") {
     await doctorTask();
   } else if (command === "batch") {
@@ -96,21 +106,22 @@ async function startTask(values) {
     live: flags.has("live") || flags.has("followups"),
     json: flags.has("json"),
     boundaries: flags.has("no-boundaries") ? "" : boundaryPrompt(),
-    profile: flags.get("profile")
+    profile: flags.get("profile"),
+    approvalMode: flags.get("approval")
   });
 }
 
-async function createTask({ prompt, live, json = false, silent = false, groupId = null, boundaries = boundaryPrompt(), profile = null, cleanFirst = true }) {
+async function createTask({ prompt, live, json = false, silent = false, groupId = null, boundaries = boundaryPrompt(), profile = null, approvalMode = null, cleanFirst = true }) {
   await ensureStorage();
   if (cleanFirst) await autoClean({ silent: true });
 
   const id = timestamp();
   const createdAt = now();
-  const launchOptions = claudeLaunchOptions({ profile });
+  const launchOptions = claudeLaunchOptions({ profile, approvalMode });
   const timeoutMs = parseNonNegativeInt(process.env.CLAUDE_TASK_TIMEOUT_MS || "0", "CLAUDE_TASK_TIMEOUT_MS");
   const eventLimit = eventLimitValue();
   const fullPrompt = [
-    "Please complete this read-only task.",
+    taskIntro(launchOptions),
     "",
     prompt,
     boundaries ? `\n${boundaries}` : ""
@@ -141,6 +152,7 @@ async function createTask({ prompt, live, json = false, silent = false, groupId 
     totalCostUsd: null,
     usage: null,
     permissionDenials: [],
+    pendingApproval: null,
     error: null,
     stopRequestedAt: null,
     inboxOffset: 0,
@@ -324,6 +336,7 @@ async function statusTask(values) {
   if (task.sessionId) console.log(`sessionId: ${task.sessionId}`);
   if (task.totalCostUsd !== null && task.totalCostUsd !== undefined) console.log(`totalCostUsd: ${task.totalCostUsd}`);
   if (task.live) console.log("live: true");
+  if (task.pendingApproval?.status === "pending") console.log(`pendingApproval: ${task.pendingApproval.id} ${task.pendingApproval.toolName}`);
   if (task.error) console.log(`error: ${task.error}`);
   console.log(`prompt: ${task.prompt}`);
 }
@@ -388,6 +401,55 @@ async function stopOneTask(id) {
   return { taskId: id, status: "canceled" };
 }
 
+async function approvalsTask(values) {
+  const { flags, rest } = parseFlags(values);
+  const id = rest[0] || await latestTaskId();
+  if (!id) throw new Error("Missing task id. Use list first.");
+  const task = await readTask(id);
+  const approval = task.pendingApproval || null;
+  if (flags.has("json")) {
+    console.log(JSON.stringify({ taskId: id, approval }, null, 2));
+    return;
+  }
+  if (!approval || approval.status !== "pending") {
+    console.log(`No pending approval for Claude Code task: ${id}`);
+    return;
+  }
+  console.log(`task: ${id}`);
+  console.log(`approval: ${approval.id}`);
+  console.log(`tool: ${approval.toolName}`);
+  if (approval.title) console.log(`title: ${approval.title}`);
+  if (approval.description) console.log(`description: ${approval.description}`);
+  if (approval.inputPreview) console.log(`input: ${approval.inputPreview}`);
+  console.log(`approve: node ${displayPath(process.argv[1])} approve ${id} ${approval.id}`);
+  console.log(`deny: node ${displayPath(process.argv[1])} deny ${id} ${approval.id}`);
+}
+
+async function decideApprovalTask(values, decision) {
+  const { rest } = parseFlags(values);
+  const id = rest[0] || await latestTaskId();
+  if (!id) throw new Error("Missing task id. Use list first.");
+  const task = await readTask(id);
+  const approval = task.pendingApproval;
+  if (!approval || approval.status !== "pending") throw new Error(`No pending approval for task ${id}.`);
+  const requestedApprovalId = rest[1] || approval.id;
+  if (requestedApprovalId !== approval.id) {
+    throw new Error(`Approval id mismatch. Pending approval is ${approval.id}.`);
+  }
+  const decidedAt = now();
+  const message = rest.slice(2).join(" ").trim();
+  await updateTask(id, {
+    pendingApproval: {
+      ...approval,
+      status: decision,
+      decidedAt,
+      message: message || null
+    },
+    updatedAt: decidedAt
+  }, event(`approval-${decision}`, `${approval.toolName} ${decision}`, { approvalId: approval.id }));
+  console.log(`${decision === "approved" ? "Approved" : "Denied"} Claude Code approval: ${approval.id}`);
+}
+
 async function doctorTask() {
   let ok = true;
   console.log(`node: ${process.versions.node}`);
@@ -432,6 +494,7 @@ async function batchTask(values) {
       groupId,
       boundaries: flags.has("no-boundaries") ? "" : boundaryPrompt(),
       profile: flags.get("profile"),
+      approvalMode: flags.get("approval"),
       cleanFirst: false
     }));
   }
@@ -663,10 +726,17 @@ function claudeLaunchOptions(options = {}) {
   const profileName = String(options.profile || process.env.CLAUDE_TASK_PROFILE || "safe");
   const profile = toolProfiles[profileName];
   if (!profile) throw new Error(`Unknown Claude task profile: ${profileName}. Use safe, research, or full.`);
+  const approvalMode = normalizeApprovalMode(options.approvalMode || process.env.CLAUDE_TASK_APPROVAL_MODE || profile.approvalMode || "deny");
+  const requestedPermissionMode = options.permissionMode || process.env.CLAUDE_TASK_PERMISSION_MODE || null;
+  let permissionMode = requestedPermissionMode || profile.permissionMode;
+  if (!requestedPermissionMode && approvalMode !== "deny" && permissionMode === "dontAsk") {
+    permissionMode = "default";
+  }
   const tools = parseToolsOverride(process.env.CLAUDE_TASK_TOOLS, profile.tools);
   return {
     profile: profileName,
-    permissionMode: options.permissionMode || process.env.CLAUDE_TASK_PERMISSION_MODE || profile.permissionMode,
+    permissionMode,
+    approvalMode,
     allowedTools: splitCsv(process.env.CLAUDE_TASK_ALLOWED_TOOLS) || profile.allowedTools,
     tools,
     persistSession: process.env.CLAUDE_TASK_SESSION_PERSISTENCE === "1",
@@ -684,6 +754,7 @@ function sdkOptions(task, abortController) {
     cwd: task.cwd,
     abortController,
     permissionMode: saved.permissionMode || "dontAsk",
+    canUseTool: createApprovalHandler(task.id, saved.approvalMode || "deny"),
     tools: deserializeTools(saved.tools),
     allowedTools: Array.isArray(saved.allowedTools) ? saved.allowedTools : [],
     persistSession: saved.persistSession === true,
@@ -700,6 +771,7 @@ function publicLaunchOptions(options) {
   return {
     profile: options.profile,
     permissionMode: options.permissionMode,
+    approvalMode: options.approvalMode,
     tools: serializeTools(options.tools),
     allowedTools: options.allowedTools,
     persistSession: options.persistSession,
@@ -727,6 +799,195 @@ function parseToolsOverride(value, fallback) {
   if (!value) return fallback;
   if (value === "default" || value === "claude_code") return { type: "preset", preset: "claude_code" };
   return splitCsv(value) || [];
+}
+
+function normalizeApprovalMode(value) {
+  const mode = String(value || "deny").trim().toLowerCase();
+  if (mode === "yes") return "allow";
+  if (mode === "no") return "deny";
+  if (mode === "prompt") return "ask";
+  if (mode === "ask" || mode === "allow" || mode === "deny") return mode;
+  throw new Error(`Invalid approval mode: ${value}. Use ask, allow, or deny.`);
+}
+
+function taskIntro(options) {
+  if (options.profile === "full") {
+    return "Please complete this Claude Code helper task within the configured approvals.";
+  }
+  return "Please complete this bounded read-only helper task.";
+}
+
+function createApprovalHandler(taskId, approvalMode) {
+  const mode = normalizeApprovalMode(approvalMode);
+  return async (toolName, input, context = {}) => {
+    if (mode === "allow" && toolName !== "AskUserQuestion") {
+      await recordEvent(taskId, event("approval-auto-allowed", `${toolName} allowed`, { toolName }));
+      return { behavior: "allow", updatedInput: input };
+    }
+    if (mode === "deny") {
+      await recordEvent(taskId, event("approval-denied", `${toolName} denied by approval mode`, { toolName }));
+      return { behavior: "deny", message: "Codex bridge approval mode denied this tool request." };
+    }
+
+    const approvalId = `approval-${timestamp()}`;
+    const request = {
+      id: approvalId,
+      status: "pending",
+      toolName,
+      title: context.title || "",
+      displayName: context.displayName || "",
+      description: context.description || "",
+      inputPreview: approvalInputPreview(toolName, input),
+      createdAt: now()
+    };
+    await updateTask(taskId, {
+      pendingApproval: request
+    }, event("approval-requested", approvalEventText(request), { approvalId, toolName }));
+
+    if (toolName === "AskUserQuestion") {
+      return handleQuestionApproval(taskId, request, input, context);
+    }
+
+    if (process.stdin.isTTY) {
+      const allowed = await askYesNo(`${approvalEventText(request)}\nAllow this action?`);
+      await finalizeApprovalRequest(taskId, approvalId, allowed ? "approved" : "denied");
+      await consumeApprovalRequest(taskId, approvalId);
+      if (allowed) return { behavior: "allow", updatedInput: input };
+      return { behavior: "deny", message: "User denied this tool request." };
+    }
+
+    process.stderr.write([
+      `Claude Code approval required for task ${taskId}.`,
+      `approval: ${approvalId}`,
+      `tool: ${toolName}`,
+      request.title ? `title: ${request.title}` : "",
+      request.inputPreview ? `input: ${request.inputPreview}` : "",
+      `approve: node ${displayPath(process.argv[1])} approve ${taskId} ${approvalId}`,
+      `deny: node ${displayPath(process.argv[1])} deny ${taskId} ${approvalId}`,
+      ""
+    ].filter(Boolean).join("\n"));
+
+    const decision = await waitForApprovalDecision(taskId, approvalId, context.signal);
+    if (decision.status === "approved") return { behavior: "allow", updatedInput: input };
+    return { behavior: "deny", message: decision.message || "User denied this tool request." };
+  };
+}
+
+async function handleQuestionApproval(taskId, request, input, context) {
+  if (!process.stdin.isTTY) {
+    process.stderr.write([
+      `Claude Code question requires an interactive terminal for task ${taskId}.`,
+      `approval: ${request.id}`,
+      `deny: node ${displayPath(process.argv[1])} deny ${taskId} ${request.id}`,
+      ""
+    ].join("\n"));
+    const decision = await waitForApprovalDecision(taskId, request.id, context.signal);
+    return { behavior: "deny", message: decision.message || "No interactive answer was provided." };
+  }
+
+  const questions = Array.isArray(input?.questions) ? input.questions : [];
+  const answers = {};
+  for (const question of questions) {
+    const options = Array.isArray(question.options) ? question.options : [];
+    process.stderr.write(`\n${question.header || "Question"}: ${question.question}\n`);
+    options.forEach((option, index) => {
+      process.stderr.write(`  ${index + 1}. ${option.label}${option.description ? ` - ${option.description}` : ""}\n`);
+    });
+    const answer = await askLine(question.multiSelect ? "Choose numbers separated by commas, or type an answer: " : "Choose a number, or type an answer: ");
+    answers[question.question] = parseQuestionAnswer(answer, options, Boolean(question.multiSelect));
+  }
+  await finalizeApprovalRequest(taskId, request.id, "approved");
+  await consumeApprovalRequest(taskId, request.id);
+  return {
+    behavior: "allow",
+    updatedInput: {
+      questions,
+      answers
+    }
+  };
+}
+
+async function waitForApprovalDecision(taskId, approvalId, signal) {
+  while (!signal?.aborted) {
+    if (existsSync(taskStopFile(taskId))) {
+      await finalizeApprovalRequest(taskId, approvalId, "denied", "Task was stopped before approval.");
+      return { status: "denied", message: "Task was stopped before approval." };
+    }
+    const task = await readTask(taskId).catch(() => null);
+    const approval = task?.pendingApproval;
+    if (approval?.id === approvalId && approval.status !== "pending") {
+      await consumeApprovalRequest(taskId, approvalId);
+      return approval;
+    }
+    await delay(pollMsValue());
+  }
+  await finalizeApprovalRequest(taskId, approvalId, "denied", "Approval wait was aborted.");
+  return { status: "denied", message: "Approval wait was aborted." };
+}
+
+async function finalizeApprovalRequest(taskId, approvalId, status, message = null) {
+  const task = await readTask(taskId).catch(() => null);
+  const approval = task?.pendingApproval;
+  if (!approval || approval.id !== approvalId) return;
+  const decidedAt = now();
+  await updateTask(taskId, {
+    pendingApproval: {
+      ...approval,
+      status,
+      decidedAt,
+      message
+    },
+    updatedAt: decidedAt
+  }, event(`approval-${status}`, `${approval.toolName} ${status}`, { approvalId }));
+}
+
+async function consumeApprovalRequest(taskId, approvalId) {
+  const task = await readTask(taskId).catch(() => null);
+  const approval = task?.pendingApproval;
+  if (!approval || approval.id !== approvalId || approval.status === "pending") return;
+  await updateTask(taskId, {
+    pendingApproval: null
+  }, event(`approval-${approval.status}-consumed`, `${approval.toolName} ${approval.status}`, { approvalId }));
+}
+
+function approvalEventText(request) {
+  return [
+    `${request.toolName} requested approval`,
+    request.title,
+    request.inputPreview
+  ].filter(Boolean).join(": ");
+}
+
+function approvalInputPreview(toolName, input) {
+  if (toolName === "Bash" && typeof input?.command === "string") return clip(input.command, 2000);
+  if (toolName === "AskUserQuestion") return clip(JSON.stringify(input?.questions || []), 2000);
+  return clip(JSON.stringify(input || {}), 2000);
+}
+
+async function askYesNo(question) {
+  const answer = await askLine(`${question}\n[y/N] `);
+  return /^(y|yes)$/iu.test(answer.trim());
+}
+
+async function askLine(question) {
+  const { createInterface } = await import("node:readline/promises");
+  const readline = createInterface({ input: process.stdin, output: process.stderr });
+  try {
+    return await readline.question(question);
+  } finally {
+    readline.close();
+  }
+}
+
+function parseQuestionAnswer(answer, options, multiSelect) {
+  const trimmed = answer.trim();
+  if (!trimmed) return "";
+  const numbers = trimmed.split(",").map((part) => Number.parseInt(part.trim(), 10) - 1);
+  if (numbers.every((number) => Number.isInteger(number) && number >= 0 && number < options.length)) {
+    const labels = numbers.map((number) => options[number]?.label).filter(Boolean);
+    return multiSelect ? labels : labels[0];
+  }
+  return trimmed;
 }
 
 async function handleSdkMessage(id, message) {
@@ -1025,8 +1286,10 @@ function publicTask(task) {
     live: Boolean(task.live),
     profile: task.profile || null,
     permissionMode: task.options?.permissionMode || null,
+    approvalMode: task.options?.approvalMode || null,
     tools: task.options?.tools || null,
     allowedTools: task.options?.allowedTools || null,
+    pendingApproval: task.pendingApproval || null,
     persistSession: task.options?.persistSession === true,
     timeoutMs: Number.isInteger(task.timeoutMs) ? task.timeoutMs : null,
     startedAt: task.startedAt || null,
@@ -1151,7 +1414,7 @@ function parseBatchPrompts(source, flags) {
 function parseFlags(values) {
   const flags = new Map();
   const rest = [];
-  const valueFlags = new Set(["file", "lines", "n", "concurrency", "older-than", "separator", "profile", "keep"]);
+  const valueFlags = new Set(["file", "lines", "n", "concurrency", "older-than", "separator", "profile", "approval", "keep"]);
   for (let index = 0; index < values.length; index += 1) {
     const value = values[index];
     if (value === "--") {
@@ -1359,13 +1622,16 @@ function printHelp() {
     "Claude Code tracked task helper backed by the Claude Agent TypeScript SDK.",
     "",
     "Commands:",
-    "  claude-task.mjs start [--profile safe|research|full] [--json] [--file prompt.md] [--stdin] <prompt>",
-    "  claude-task.mjs start --live [--profile safe|research|full] [--json] [--file prompt.md] [--stdin] <prompt>",
+    "  claude-task.mjs start [--profile safe|research|full] [--approval ask|allow|deny] [--json] [--file prompt.md] [--stdin] <prompt>",
+    "  claude-task.mjs start --live [--profile safe|research|full] [--approval ask|allow|deny] [--json] [--file prompt.md] [--stdin] <prompt>",
     "  claude-task.mjs wait [--retry-stale] [--retry-failed] [task-id]",
     "  claude-task.mjs ask <task-id> <follow-up>",
     "  claude-task.mjs finish <task-id>",
     "  claude-task.mjs stop [task-id]",
-    "  claude-task.mjs batch [--profile safe|research|full] [--json] [--file tasks.txt] [--stdin] [--separator=---] [--jsonl]",
+    "  claude-task.mjs approvals [--json] [task-id]",
+    "  claude-task.mjs approve <task-id> [approval-id]",
+    "  claude-task.mjs deny <task-id> [approval-id] [message]",
+    "  claude-task.mjs batch [--profile safe|research|full] [--approval ask|allow|deny] [--json] [--file tasks.txt] [--stdin] [--separator=---] [--jsonl]",
     "  claude-task.mjs wait-group [--json] [--retry-failed] [--concurrency n] [group-id]",
     "  claude-task.mjs group-status [--json] [group-id]",
     "  claude-task.mjs group-result [--json] [group-id]",
